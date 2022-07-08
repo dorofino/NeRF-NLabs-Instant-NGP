@@ -46,6 +46,7 @@
 #  include <imgui/backends/imgui_impl_glfw.h>
 #  include <imgui/backends/imgui_impl_opengl3.h>
 #  include <imguizmo/ImGuizmo.h>
+#  include <stb_image/stb_image.h>
 #  ifdef _WIN32
 #    include <GL/gl3w.h>
 #  else
@@ -668,7 +669,7 @@ void Testbed::imgui() {
 			accum_reset |= ImGui::Checkbox("Apply lens distortion", &m_nerf.render_with_camera_distortion);
 
 			if (m_nerf.render_with_camera_distortion) {
-				accum_reset |= ImGui::Combo("Distortion mode", (int*)&m_nerf.render_distortion.mode, "None\0Iterative\0F-Theta\0");
+				accum_reset |= ImGui::Combo("Distortion mode", (int*)&m_nerf.render_distortion.mode, "None\0Iterative\0F-Theta\0LatLong\0");
 				if (m_nerf.render_distortion.mode == ECameraDistortionMode::Iterative) {
 					accum_reset |= ImGui::InputFloat("k1", &m_nerf.render_distortion.params[0], 0.f, 0.f, "%.5f");
 					accum_reset |= ImGui::InputFloat("k2", &m_nerf.render_distortion.params[1], 0.f, 0.f, "%.5f");
@@ -769,11 +770,11 @@ void Testbed::imgui() {
 					ImGui::PlotLines("Training view exposures", exposures.data(), exposures.size(), 0, nullptr, FLT_MAX, FLT_MAX, ImVec2(0, 60.f));
 				}
 
-				if (ImGui::SliderInt("glow mode", &m_nerf.m_glow_mode, 0, 16)) {
+				if (ImGui::SliderInt("glow mode", &m_nerf.glow_mode, 0, 16)) {
 					accum_reset = true;
 				}
 
-				if (m_nerf.m_glow_mode && ImGui::SliderFloat("glow pos", &m_nerf.m_glow_y_cutoff, -2.f, 3.f)) {
+				if (m_nerf.glow_mode && ImGui::SliderFloat("glow pos", &m_nerf.glow_y_cutoff, -2.f, 3.f)) {
 					accum_reset = true;
 				}
 			}
@@ -1138,6 +1139,10 @@ bool Testbed::keyboard_event() {
 		return false;
 	}
 
+	if (m_keyboard_event_callback && m_keyboard_event_callback()) {
+		return false;
+	}
+
 	for (int idx = 0; idx < std::min((int)ERenderMode::NumRenderModes, 10); ++idx) {
 		char c[] = { "1234567890" };
 		if (ImGui::IsKeyPressed(c[idx])) {
@@ -1168,7 +1173,7 @@ bool Testbed::keyboard_event() {
 		}
 	}
 	if (ImGui::IsKeyPressed('O')) {
-		m_nerf.training.render_error_overlay=!m_nerf.training.render_error_overlay;
+		m_nerf.training.render_error_overlay = !m_nerf.training.render_error_overlay;
 	}
 	if (ImGui::IsKeyPressed('G')) {
 		m_render_ground_truth = !m_render_ground_truth;
@@ -1380,16 +1385,44 @@ bool Testbed::begin_frame_and_handle_user_input() {
 	return true;
 }
 
+void Testbed::SecondWindow::draw(GLuint texture) {
+	if (!window)
+		return;
+	int display_w, display_h;
+	GLFWwindow *old_context = glfwGetCurrentContext();
+	glfwMakeContextCurrent(window);
+	glfwGetFramebufferSize(window, &display_w, &display_h);
+	glViewport(0, 0, display_w, display_h);
+	glClearColor(0.f,0.f,0.f, 1.f);
+	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+	glEnable(GL_TEXTURE_2D);
+	glBindTexture(GL_TEXTURE_2D, texture);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glBindVertexArray(vao);
+	if (program)
+		glUseProgram(program);
+	glDrawArrays(GL_TRIANGLES, 0, 6);
+	glBindVertexArray(0);
+	glUseProgram(0);
+	glfwSwapBuffers(window);
+	glfwMakeContextCurrent(old_context);
+}
+
 void Testbed::draw_gui() {
 	// Make sure all the cuda code finished its business here
 	CUDA_CHECK_THROW(cudaDeviceSynchronize());
-
+	if (!m_render_textures.empty())
+		m_second_window.draw((GLuint)m_render_textures.front()->texture());
+	glfwMakeContextCurrent(m_glfw_window);
 	int display_w, display_h;
-
 	glfwGetFramebufferSize(m_glfw_window, &display_w, &display_h);
 	glViewport(0, 0, display_w, display_h);
 	glClearColor(0.f, 0.f, 0.f, 0.f);
 	glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
 
 	ImDrawList* list = ImGui::GetBackgroundDrawList();
 	list->AddCallback([](const ImDrawList*, const ImDrawCmd*) {
@@ -1606,7 +1639,77 @@ void Testbed::train_and_render(bool skip_rendering) {
 }
 
 
-void Testbed::init_window(int resw, int resh, bool hidden) {
+#ifdef NGP_GUI
+void Testbed::create_second_window() {
+	if (m_second_window.window) {
+		return;
+	}
+	bool frameless = false;
+	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
+	glfwWindowHint(GLFW_RESIZABLE, !frameless);
+	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
+	glfwWindowHint(GLFW_CENTER_CURSOR, false);
+	glfwWindowHint(GLFW_DECORATED, !frameless);
+	glfwWindowHint(GLFW_SCALE_TO_MONITOR, frameless);
+	glfwWindowHint(GLFW_TRANSPARENT_FRAMEBUFFER, true);
+	// get the window size / coordinates
+	int win_w=0,win_h=0,win_x=0,win_y=0;
+	GLuint ps=0,vs=0;
+	{
+		win_w = 1920;
+		win_h = 1080;
+		win_x = 0x40000000;
+		win_y = 0x40000000;
+		static const char* copy_shader_vert = "\
+			layout (location = 0)\n\
+			in vec2 vertPos_data;\n\
+			out vec2 texCoords;\n\
+			void main(){\n\
+				gl_Position = vec4(vertPos_data.xy, 0.0, 1.0);\n\
+				texCoords = (vertPos_data.xy + 1.0) * 0.5; texCoords.y=1.0-texCoords.y;\n\
+			}";
+		static const char* copy_shader_frag = "\
+			in vec2 texCoords;\n\
+			out vec4 fragColor;\n\
+			uniform sampler2D screenTex;\n\
+			void main(){\n\
+				fragColor = texture(screenTex, texCoords.xy);\n\
+			}";
+		vs = compile_shader(false, copy_shader_vert);
+		ps = compile_shader(true, copy_shader_frag);
+	}
+	m_second_window.window = glfwCreateWindow(win_w, win_h, "Fullscreen Output", NULL, m_glfw_window);
+	if (win_x!=0x40000000) glfwSetWindowPos(m_second_window.window, win_x, win_y);
+	glfwMakeContextCurrent(m_second_window.window);
+	m_second_window.program = glCreateProgram();
+	glAttachShader(m_second_window.program, vs);
+	glAttachShader(m_second_window.program, ps);
+	glLinkProgram(m_second_window.program);
+	if (!check_shader(m_second_window.program, "shader program", true)) {
+		glDeleteProgram(m_second_window.program);
+		m_second_window.program = 0;
+	}
+	// vbo and vao
+	glGenVertexArrays(1, &m_second_window.vao);
+	glGenBuffers(1, &m_second_window.vbo);
+	glBindVertexArray(m_second_window.vao);
+	const float fsquadVerts[] = {
+		-1.0f, -1.0f,
+		-1.0f, 1.0f,
+		1.0f, 1.0f,
+		1.0f, 1.0f,
+		1.0f, -1.0f,
+		-1.0f, -1.0f};
+	glBindBuffer(GL_ARRAY_BUFFER, m_second_window.vbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(fsquadVerts), fsquadVerts, GL_STATIC_DRAW);
+	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void *)0);
+	glEnableVertexAttribArray(0);
+	glBindBuffer(GL_ARRAY_BUFFER, 0);
+	glBindVertexArray(0);
+}
+#endif //NGP_GUI
+
+void Testbed::init_window(int resw, int resh, bool hidden, bool second_window) {
 #ifndef NGP_GUI
 	throw std::runtime_error{"init_window failed: NGP was built without GUI support"};
 #else
@@ -1743,7 +1846,10 @@ void Testbed::init_window(int resw, int resh, bool hidden) {
 
 	m_render_window = true;
 
-#endif
+	if (m_second_window.window == nullptr && second_window) {
+		create_second_window();
+	}
+#endif // NGP_GUI
 }
 
 void Testbed::destroy_window() {
@@ -1971,7 +2077,7 @@ Testbed::NetworkDims Testbed::network_dims() const {
 	}
 }
 
-void Testbed::reset_network() {
+void Testbed::reset_network(bool clear_density_grid) {
 	m_sdf.iou_decay = 0;
 
 	m_rng = default_rng_t{m_seed};
@@ -2185,6 +2291,11 @@ void Testbed::reset_network() {
 		if (m_nerf.training.dataset.envmap_data.data()) {
 			m_envmap.trainer->set_params_full_precision(m_nerf.training.dataset.envmap_data.data(), m_nerf.training.dataset.envmap_data.size());
 		}
+	}
+
+	if (clear_density_grid) {
+		m_nerf.density_grid.memset(0);
+		m_nerf.density_grid_bitfield.memset(0);
 	}
 }
 
@@ -2687,13 +2798,24 @@ void Testbed::gather_histograms() {
 	}
 }
 
+// Increment this number when making a change to the snapshot format
+static const size_t SNAPSHOT_FORMAT_VERSION = 1;
+
 void Testbed::save_snapshot(const std::string& filepath_string, bool include_optimizer_state) {
 	fs::path filepath = filepath_string;
 	m_network_config["snapshot"] = m_trainer->serialize(include_optimizer_state);
+	m_network_config["snapshot"]["version"] = SNAPSHOT_FORMAT_VERSION;
 
 	if (m_testbed_mode == ETestbedMode::Nerf) {
 		m_network_config["snapshot"]["density_grid_size"] = NERF_GRIDSIZE();
-		m_network_config["snapshot"]["density_grid_binary"] = m_nerf.density_grid;
+
+		GPUMemory<__half> density_grid_fp16(m_nerf.density_grid.size());
+		parallel_for_gpu(density_grid_fp16.size(), [density_grid=m_nerf.density_grid.data(), density_grid_fp16=density_grid_fp16.data()] __device__ (size_t i) {
+			density_grid_fp16[i] = (__half)density_grid[i];
+		});
+
+		m_network_config["snapshot"]["density_grid_binary"] = density_grid_fp16;
+		m_network_config["snapshot"]["nerf"]["aabb_scale"] = m_nerf.training.dataset.aabb_scale;
 	}
 
 	m_network_config["snapshot"]["training_step"] = m_training_step;
@@ -2717,29 +2839,50 @@ void Testbed::load_snapshot(const std::string& filepath_string) {
 		throw std::runtime_error{std::string{"File '"} + filepath_string + "' does not contain a snapshot."};
 	}
 
+	if (config["snapshot"].value("version", 0) < SNAPSHOT_FORMAT_VERSION) {
+		throw std::runtime_error{"Snapshot uses an old format."};
+	}
+
 	if (m_testbed_mode == ETestbedMode::Nerf) {
 		if (config["snapshot"]["density_grid_size"] != NERF_GRIDSIZE()) {
-			throw std::runtime_error{"Incompatible grid size in snapshot."};
+			throw std::runtime_error{"Incompatible grid size."};
 		}
 
 		m_nerf.training.counters_rgb.rays_per_batch = config["snapshot"]["nerf"]["rgb"]["rays_per_batch"];
 		m_nerf.training.counters_rgb.measured_batch_size = config["snapshot"]["nerf"]["rgb"]["measured_batch_size"];
 		m_nerf.training.counters_rgb.measured_batch_size_before_compaction = config["snapshot"]["nerf"]["rgb"]["measured_batch_size_before_compaction"];
+
 		// If we haven't got a nerf dataset loaded, load dataset metadata from the snapshot
 		// and render using just that.
 		if (m_data_path.empty() && config["snapshot"]["nerf"].contains("dataset")) {
 			m_nerf.training.dataset = config["snapshot"]["nerf"]["dataset"];
 			load_nerf();
+		} else {
+			if (config["snapshot"]["nerf"].contains("aabb_scale")) {
+				m_nerf.training.dataset.aabb_scale = config["snapshot"]["nerf"]["aabb_scale"];
+			}
 		}
 
-		m_nerf.density_grid = config["snapshot"]["density_grid_binary"];
+		load_nerf_post();
+
+		GPUMemory<__half> density_grid_fp16 = config["snapshot"]["density_grid_binary"];
+		m_nerf.density_grid.resize(density_grid_fp16.size());
+
+		parallel_for_gpu(density_grid_fp16.size(), [density_grid=m_nerf.density_grid.data(), density_grid_fp16=density_grid_fp16.data()] __device__ (size_t i) {
+			density_grid[i] = (float)density_grid_fp16[i];
+		});
+
+		if (m_nerf.density_grid.size() != NERF_GRIDSIZE() * NERF_GRIDSIZE() * NERF_GRIDSIZE() * (m_nerf.max_cascade + 1)) {
+			throw std::runtime_error{"Incompatible number of grid cascades."};
+		}
+
 		update_density_grid_mean_and_bitfield(nullptr);
 	}
 
 	m_network_config_path = filepath_string;
 	m_network_config = config;
 
-	reset_network();
+	reset_network(false);
 
 	m_training_step = m_network_config["snapshot"]["training_step"];
 	m_loss_scalar.set(m_network_config["snapshot"]["loss"]);
