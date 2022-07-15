@@ -121,7 +121,7 @@ if __name__ == "__main__":
 		while sw*sh > 1920*1080*4:
 			sw = int(sw / 2)
 			sh = int(sh / 2)
-		testbed.init_window(sw, sh, second_window = args.second_window or False)
+		testbed.init_window(sw, sh)
 
 
 	if args.load_snapshot:
